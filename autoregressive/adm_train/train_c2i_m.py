@@ -8,6 +8,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torchvision.utils import save_image
 from glob import glob
 from copy import deepcopy
 import os,sys
@@ -23,9 +24,9 @@ from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from dataset.build import build_dataset
 from autoregressive.models.gpt_adm import GPT_models
-
-
+from diffusers.models.autoencoders import AutoencoderKL
 from prefetch_generator import BackgroundGenerator
+
 class DataLoaderX(DataLoader):
     def __iter__(self):
         return BackgroundGenerator(super().__iter__())
@@ -45,7 +46,7 @@ class AddNoise:
         for timestep in timesteps:
             result = self.alpha[timestep] * image + self.beta[timestep] * noise
             results.append(result)
-        return torch.cat(results,0)
+        return torch.stack(results,0)
             
 def diffusion_noise_schedule(schedule_type="ddpm", discrete_number=32):
     assert schedule_type in ["ddpm", "edm", "rectified_flow"], \
@@ -211,16 +212,17 @@ def main(args):
     else:
         train_steps = 0
         start_epoch = 0
-        checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
+        checkpoint = torch.load(args.gpt_finetune, map_location="cpu")
         model.load_state_dict(checkpoint["model"],strict=False)
         if args.ema:
             update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
+        logger.info(f"Initial weight from checkpoint: {args.gpt_finetune}")
 
     if not args.no_compile:
         logger.info("compiling the model... (may take several minutes)")
         model = torch.compile(model) # requires PyTorch 2.0        
     
-    model = DDP(model.to(device), device_ids=[args.gpu])
+    model = DDP(model.to(device), device_ids=[args.gpu],find_unused_parameters=True)
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     if args.ema:
         ema.eval()  # EMA model should always be in eval mode
@@ -239,7 +241,7 @@ def main(args):
         cond_idx: torch.Tensor,  # [bs, 1]
         cond_time: torch.Tensor, # [bs, t]
     """
-    alphas, betas = diffusion_noise_schedule(type=args.schedule_type,discrete_number=args.discrete_number)
+    alphas, betas = diffusion_noise_schedule(schedule_type=args.schedule_type,discrete_number=args.discrete_number)
     addnoiser = AddNoise(alpha=alphas,beta=betas)
     t_index = [i for i in range(args.discrete_number)]
     for epoch in range(start_epoch, args.epochs):
@@ -248,15 +250,13 @@ def main(args):
         for x, y in loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            z_indices = x.reshape(x.shape[0], -1, args.input_size * args.input_size * args.in_channels)
-            if z_indices.shape[1]>1:
-                original_indices = z_indices = z_indices[:,torch.randint(0,z_indices.shape[1],1).int().item(),:] # [bs, dim]
+            z_indices = original_indices = x
             noises = torch.randn_like(z_indices)
             c_indices = y.reshape(-1) # [bs, 1]
             z_indices = einops.rearrange(addnoiser(z_indices,noises,t_index),"t b d -> b t d") # [bs, t, dim]
             t_indices = torch.Tensor(t_index).unsqueeze(0).repeat(z_indices.shape[0], 1) # [bs, t]
-            z_indices = z_indices[:,::-1,:]
-            t_indices = t_indices[:,::-1]
+            z_indices = torch.flip(z_indices,[1])
+            t_indices = torch.flip(t_indices,[1])
             assert z_indices.shape[0] == c_indices.shape[0]
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 reconstructed_img, loss = model(cond_idx=c_indices, idx=z_indices, 
@@ -294,7 +294,7 @@ def main(args):
                 start_time = time.time()
 
             # Save checkpoint:
-            if train_steps % args.ckpt_every == 0 and train_steps > 0:
+            if train_steps % args.ckpt_every == 0: #and train_steps > 0:
                 if rank == 0:
                     if not args.no_compile:
                         model_weight = model.module._orig_mod.state_dict()
@@ -316,6 +316,15 @@ def main(args):
                     cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, cloud_checkpoint_path)
                     logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
+                    
+                    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+                    example = reconstructed_img[0,0,:].view(1,args.in_channels,args.input_size,args.input_size) / 0.18215
+                    example2 = reconstructed_img[0,-1,:].view(1,args.in_channels,args.input_size,args.input_size) / 0.18215
+                    example3 = reconstructed_img[1,0,:].view(1,args.in_channels,args.input_size,args.input_size) / 0.18215
+                    example4 = reconstructed_img[1,-1,:].view(1,args.in_channels,args.input_size,args.input_size) / 0.18215
+                    samples = vae.decode(torch.cat([example,example2,example3,example4],0)).sample
+                    save_image(samples, "sample.png", nrow=2, normalize=True, value_range=(-1, 1))
+                    logger.info(f"visualization....")
                 dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
@@ -333,6 +342,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-local-save", action='store_true', help='no save checkpoints to local path for limited disk volume')
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-B")
     parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path for resume training")
+    parser.add_argument("--gpt-finetune", type=str, default=None, help="used for our method's fast evaluation")
     parser.add_argument("--gpt-type", type=str, choices=['c2i', 't2i'], default="c2i", help="class-conditional or text-conditional")
     parser.add_argument("--ema", action='store_true', help="whether using ema training")
     parser.add_argument("--input-size", type=int, default=32, help="the size of latent code")
@@ -344,7 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout-p", type=float, default=0.1, help="dropout_p of resid_dropout_p and ffn_dropout_p")
     parser.add_argument("--token-dropout-p", type=float, default=0.1, help="dropout_p of token_dropout_p")
     parser.add_argument("--drop-path-rate", type=float, default=0.0, help="using stochastic depth decay")
-    parser.add_argument("--no-compile", action='store_true')
+    parser.add_argument("--no-compile", type=bool, default=False)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--dataset", type=str, default='imagenet_code')
     parser.add_argument("--image-size", type=int, choices=[256, 384, 448, 512], default=256)
@@ -356,7 +366,7 @@ if __name__ == "__main__":
     parser.add_argument("--beta1", type=float, default=0.9, help="beta1 parameter for the Adam optimizer")
     parser.add_argument("--beta2", type=float, default=0.95, help="beta2 parameter for the Adam optimizer")
     parser.add_argument("--max-grad-norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--global-batch-size", type=int, default=64)
+    parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument("--log-every", type=int, default=100)

@@ -8,7 +8,7 @@
 from dataclasses import dataclass
 from typing import Optional, List
 
-
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -73,7 +73,7 @@ class FinalLayer(nn.Module):
         )
 
     def forward(self, x, c):
-        if cond_embeddings is not None:
+        if c is not None:
             shift, scale = self.adaLN_modulation(c).chunk(2, dim=2)
         else:
             shift, scale = 0, 1
@@ -333,7 +333,7 @@ class TransformerBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int, cond_embeddings: torch.Tensor, mask: Optional[torch.Tensor] = None):
         if cond_embeddings is not None:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=2)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(cond_embeddings).chunk(6, dim=2)
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = 0, 1, 1, 0, 1, 1
         h = x + gate_msa * self.drop_path(self.attention(modulate(self.attention_norm(x),shift_msa, scale_msa), freqs_cis, start_pos, mask))
@@ -381,7 +381,7 @@ class Transformer(nn.Module):
         self.output = FinalLayer(config.dim,self.patch_size,self.in_channels)
 
         # 2d rotary pos embedding
-        self.freqs_cis = precompute_freqs_cis_2d(config.discrete_number, self.num_patches, self.config.dim // self.config.n_head, self.config.rope_base, 0)
+        self.freqs_cis = precompute_freqs_cis_2d(config.discrete_number, self.num_patches, self.config.dim // self.config.n_head, self.config.rope_base)
         
         # KVCache
         self.max_batch_size = -1
@@ -394,7 +394,7 @@ class Transformer(nn.Module):
         self.apply(self._init_weights)
 
         # Zero-out output layers:
-        nn.init.constant_(self.output.weight, 0)
+        nn.init.constant_(self.output.linear.weight, 0)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -419,7 +419,7 @@ class Transformer(nn.Module):
         for i in range(0, token_embeddings.shape[1], self.num_patches):
             casual_mask[i:i+self.num_patches,i:i+self.num_patches] = 1
         self.causal_mask = causal_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
-        self.freqs_cis = precompute_freqs_cis_2d(config.discrete_number, self.num_patches, self.config.dim // self.config.n_head, self.config.rope_base, 0)
+        self.freqs_cis = precompute_freqs_cis_2d(config.discrete_number, self.num_patches, self.config.dim // self.config.n_head, self.config.rope_base)
 
     def forward(
         self, 
@@ -434,11 +434,12 @@ class Transformer(nn.Module):
         
         _b, _c, _d = idx.shape
         if idx is not None and cond_idx is not None: # training or naive inference
-            cond_embeddings = self.cls_embedding(cond_idx, train=self.training).unsqueeze(1) # [bs, 1, dim]
-            time_embeddings = self.t_embedding(cond_time.view(-1)).view(_b, -1, config.dim) # [bs, t, dim]
-            cond_embeddings = (cond_embeddings + time_embeddings).unsqueeze(2).expand(-1,-1,self.num_patches,-1).view(_b, -1, config.dim)
+            cond_embeddings = self.cls_embedding(cond_idx, train=self.training) # [bs, 1, dim]
+            time_embeddings = self.t_embedding(cond_time.view(-1)).view(_b, -1, self.config.dim) # [bs, t, dim]
+            cond_embeddings = (cond_embeddings + time_embeddings).unsqueeze(2).expand(-1,-1,self.num_patches,-1)
+            cond_embeddings = einops.rearrange(cond_embeddings, "b c p d -> b (c p) d")
             
-            token_embeddings = self.tok_embeddings(einops.rearrange(idx,"b c d -> (b c) e f g",
+            token_embeddings = self.tok_embeddings(einops.rearrange(idx,"b c (e f g) -> (b c) e f g",
                                                                     e=self.in_channels,
                                                                     f=self.input_size,
                                                                     g=self.input_size)) # [bsxt, number of token, dim]
@@ -461,14 +462,15 @@ class Transformer(nn.Module):
         
         if self.training:
             freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
-            mask = torch.full((token_embeddings.shape[1], token_embeddings.shape[1]), float("-inf"), device=tokens.device)
+            mask = torch.full((token_embeddings.shape[1], token_embeddings.shape[1]), float("-inf"), device=token_embeddings.device)
             mask = torch.triu(mask, diagonal=1)
             for i in range(0, token_embeddings.shape[1], self.num_patches):
                 mask[i:i+self.num_patches,i:i+self.num_patches] = 0
         else:
             freqs_cis = self.freqs_cis[input_pos]
+        
         # transformer blocks
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             h = layer(h, freqs_cis, input_pos, cond_embeddings, mask)
         
         # output layers
@@ -477,7 +479,7 @@ class Transformer(nn.Module):
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
-            loss = mean_flat((reconstructed_img - targets) ** 2)
+            loss = self.mean_flat((reconstructed_img - targets) ** 2).mean()
 
         return reconstructed_img, loss
 

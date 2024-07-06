@@ -44,8 +44,12 @@ class CustomDataset(Dataset):
 
         features = np.load(os.path.join(feature_dir, feature_file))
         if self.flip:
-            aug_idx = torch.randint(low=0, high=features.shape[1], size=(1,)).item()
-            features = features[:, aug_idx]
+            if features.shape[1] > 200:
+                aug_idx = torch.randint(low=0, high=features.shape[0], size=(1,)).item()
+                features = features[aug_idx]
+            else:
+                aug_idx = torch.randint(low=0, high=features.shape[1], size=(1,)).item()
+                features = features[:, aug_idx]
         labels = np.load(os.path.join(label_dir, label_file))
         return torch.from_numpy(features), torch.from_numpy(labels)
 
