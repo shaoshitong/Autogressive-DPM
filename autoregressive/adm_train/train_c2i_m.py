@@ -4,6 +4,8 @@
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -41,33 +43,46 @@ class AddNoise:
         self.alpha = alpha
         self.beta = beta
         
-    def __call__(self, image, noise, timesteps):
+    def __call__(self, image, noise=None, timesteps=[0]):
         results = []
+        labels = []
         for timestep in timesteps:
-            result = self.alpha[timestep] * image + self.beta[timestep] * noise
-            results.append(result)
-        return torch.stack(results,0)
+            if noise == None:
+                _noise = torch.randn_like(image)
+                result = self.alpha[timestep] * image + self.beta[timestep] * _noise
+                results.append(result)
+                labels.append(_noise)
+            else:
+                result = self.alpha[timestep] * image + self.beta[timestep] * noise
+                results.append(result)
+                labels.append(noise)
+        return torch.stack(results,0), torch.stack(labels, 0)
             
 def diffusion_noise_schedule(schedule_type="ddpm", discrete_number=32):
-    assert schedule_type in ["ddpm", "edm", "rectified_flow"], \
-        "we only support 'ddpm', 'edm' and 'rectified flow'!"
+    assert schedule_type in ["ddpm", "edm", "rectified_flow", "r_rectified_flow"], \
+        "we only support 'ddpm', 'edm', 'rectified flow' and 'rectified flow'!"
     
     span = int(1024/discrete_number)
+    index = 0
     if schedule_type == "ddpm":
-        diff_scheduler = DDPMScheduler(num_train_timesteps=1000)
+        diff_scheduler = DDPMScheduler(num_train_timesteps=1024)
         alpha = diff_scheduler.alphas_cumprod[::span] ** 0.5
         beta = (1 - diff_scheduler.alphas_cumprod[::span]) ** 0.5
     elif schedule_type == "edm":
-        diff_scheduler = EDMDPMSolverMultistepScheduler(num_train_timesteps=1000)
+        diff_scheduler = EDMDPMSolverMultistepScheduler(num_train_timesteps=1024)
         alpha = torch.Tensor([1.] * discrete_number)
         beta = diff_scheduler.sigmas[::span]
     elif schedule_type == "rectified_flow":
-        alpha = torch.from_numpy(np.linspace(1.0, 0.0, discrete_number+1))[1:]
-        beta = torch.from_numpy(np.linspace(0.0, 1.0, discrete_number+1))[1:]
+        alpha = torch.from_numpy(np.linspace(1.0, 1e-3, discrete_number+1))[1:]
+        beta = torch.from_numpy(np.linspace(1e-3, 1.0, discrete_number+1))[1:]
+    elif schedule_type == "r_rectified_flow":
+        index = torch.randint(0, int(256/discrete_number), size=(1,)).item() * discrete_number
+        alpha = torch.from_numpy(np.linspace(1.0, 1e-3, 256))[index:index+discrete_number]
+        beta = torch.from_numpy(np.linspace(1e-3, 1.0, 256))[index:index+discrete_number]
     else:
         raise NotImplementedError
     
-    return alpha, beta
+    return alpha, beta, [i for i in range(index,index+discrete_number,1)]
 
 
 #################################################################################
@@ -152,7 +167,6 @@ def main(args):
         patch_size=args.patch_size,
         in_channels=args.in_channels,
         discrete_number=args.discrete_number,
-        block_size=latent_size ** 2,
         num_classes=args.num_classes,
         cls_token_num=args.cls_token_num,
         model_type=args.gpt_type,
@@ -199,21 +213,30 @@ def main(args):
     # Prepare models for training:
     if args.gpt_ckpt:
         checkpoint = torch.load(args.gpt_ckpt, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
+        checkpoint["model"].pop("tok_embeddings.proj.weight")
+        checkpoint["model"].pop("output.linear.weight")
+        checkpoint["model"].pop("output.linear.bias")
+        checkpoint["ema"].pop("tok_embeddings.proj.weight")
+        checkpoint["ema"].pop("output.linear.weight")
+        checkpoint["ema"].pop("output.linear.bias")
+        model.load_state_dict(checkpoint["model"], strict=False)
         if args.ema:
-            ema.load_state_dict(checkpoint["ema"] if "ema" in checkpoint else checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        train_steps = checkpoint["steps"] if "steps" in checkpoint else int(args.gpt_ckpt.split('/')[-1].split('.')[0])
+            ema.load_state_dict(checkpoint["ema"] if "ema" in checkpoint else checkpoint["model"], strict=False)
+        # optimizer.load_state_dict(checkpoint["optimizer"])
+        train_steps = checkpoint["steps"] + 4 if "steps" in checkpoint else int(args.gpt_ckpt.split('/')[-1].split('.')[0])
         start_epoch = int(train_steps / int(len(dataset) / args.global_batch_size))
-        train_steps = int(start_epoch * int(len(dataset) / args.global_batch_size))
+        train_steps = int(start_epoch * int(len(dataset) / args.global_batch_size)) - 97
         del checkpoint
         logger.info(f"Resume training from checkpoint: {args.gpt_ckpt}")
         logger.info(f"Initial state: steps={train_steps}, epochs={start_epoch}")
     else:
         train_steps = 0
         start_epoch = 0
-        checkpoint = torch.load(args.gpt_finetune, map_location="cpu")
-        model.load_state_dict(checkpoint["model"],strict=False)
+        # dit_path = "/home/shaoshitong/project/LlamaGen/pretrained_models/DiT-XL-2-256x256.pt"
+        # checkpoint = torch.load(dit_path, map_location="cpu")
+        # from utils.weight_selection import transfer
+        # checkpoint = transfer(checkpoint, model)
+        # model.load_state_dict(checkpoint)
         if args.ema:
             update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
         logger.info(f"Initial weight from checkpoint: {args.gpt_finetune}")
@@ -222,7 +245,7 @@ def main(args):
         logger.info("compiling the model... (may take several minutes)")
         model = torch.compile(model) # requires PyTorch 2.0        
     
-    model = DDP(model.to(device), device_ids=[args.gpu],find_unused_parameters=True)
+    model = DDP(model.to(device), device_ids=[args.gpu], find_unused_parameters=True)
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     if args.ema:
         ema.eval()  # EMA model should always be in eval mode
@@ -234,14 +257,11 @@ def main(args):
     log_steps = 0
     running_loss = 0
     start_time = time.time()
-
+    if rank == 0:
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
+        
     logger.info(f"Training for {args.epochs} epochs...")
-    """_summary_
-        idx: torch.Tensor, # [bs, t, dim]
-        cond_idx: torch.Tensor,  # [bs, 1]
-        cond_time: torch.Tensor, # [bs, t]
-    """
-    alphas, betas = diffusion_noise_schedule(schedule_type=args.schedule_type,discrete_number=args.discrete_number)
+    alphas, betas, _t_indices = diffusion_noise_schedule(schedule_type=args.schedule_type,discrete_number=args.discrete_number)
     addnoiser = AddNoise(alpha=alphas,beta=betas)
     t_index = [i for i in range(args.discrete_number)]
     for epoch in range(start_epoch, args.epochs):
@@ -253,24 +273,32 @@ def main(args):
             z_indices = original_indices = x
             noises = torch.randn_like(z_indices)
             c_indices = y.reshape(-1) # [bs, 1]
-            z_indices = einops.rearrange(addnoiser(z_indices,noises,t_index),"t b d -> b t d") # [bs, t, dim]
-            t_indices = torch.Tensor(t_index).unsqueeze(0).repeat(z_indices.shape[0], 1) # [bs, t]
-            z_indices = torch.flip(z_indices,[1])
+            images = z_indices
+            z_indices, targets = addnoiser(z_indices, noises, t_index)
+            z_indices = einops.rearrange(z_indices,"t b d -> b t d") # [bs, t, dim]
+            targets = einops.rearrange(targets,"t b d -> b t d") # [bs, t, dim]
+            t_indices = torch.Tensor(_t_indices).unsqueeze(0).repeat(z_indices.shape[0], 1) # [bs, t]
+            z_indices = torch.flip(z_indices,[1]) # [noise -> image]
             t_indices = torch.flip(t_indices,[1])
+            targets = torch.flip(targets,[1])
+            images = images.unsqueeze(1).expand(-1,args.discrete_number,-1)
             assert z_indices.shape[0] == c_indices.shape[0]
-            with torch.cuda.amp.autocast(dtype=ptdtype):  
-                reconstructed_img, loss = model(cond_idx=c_indices, idx=z_indices, 
-                                                cond_time=t_indices, targets=original_indices.unsqueeze(1))
+            with torch.cuda.amp.autocast(dtype=ptdtype):
+                output, loss = model(cond_idx=c_indices, idx=z_indices, 
+                                                cond_time=t_indices, targets=targets - images)
+                loss = torch.flip(loss,[0]) # * torch.sigmoid((alphas / (betas+1e-6)) ** 2 - 1).to(loss.device) * 2
+                loss = loss.mean()
             # backward pass, with gradient scaling if training in fp16         
-            scaler.scale(loss).backward()
-            if args.max_grad_norm != 0.0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            # step the optimizer and scaler if training in fp16
-            scaler.step(optimizer)
-            scaler.update()
-            # flush the gradients as soon as we can, no need for this memory anymore
-            optimizer.zero_grad(set_to_none=True)
+            scaler.scale(loss / args.accumulate_number).backward()
+            if train_steps / args.accumulate_number:
+                if args.max_grad_norm != 0.0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                # step the optimizer and scaler if training in fp16
+                scaler.step(optimizer)
+                scaler.update()
+                # flush the gradients as soon as we can, no need for this memory anymore
+                optimizer.zero_grad(set_to_none=True)
             if args.ema:
                 update_ema(ema, model.module._orig_mod if not args.no_compile else model.module)
 
@@ -316,15 +344,20 @@ def main(args):
                     cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, cloud_checkpoint_path)
                     logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
+                    reconstructed_img = (z_indices - output * torch.flip(betas.to(output.device),[0]).unsqueeze(0).unsqueeze(2))
+                    reconstructed_img = torch.flip(reconstructed_img,[1])
+                    example = reconstructed_img[0,:,:].view(args.discrete_number,args.in_channels,args.input_size,args.input_size) / 0.18215
+                    example = torch.stack([example[0],example[12],example[22],example[31]],0)
+                    save_image(vae.decode(example.float()).sample, f"sample_{train_steps}.png", nrow=4, normalize=True, value_range=(-1, 1))
                     
-                    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
-                    example = reconstructed_img[0,0,:].view(1,args.in_channels,args.input_size,args.input_size) / 0.18215
-                    example2 = reconstructed_img[0,-1,:].view(1,args.in_channels,args.input_size,args.input_size) / 0.18215
-                    example3 = reconstructed_img[1,0,:].view(1,args.in_channels,args.input_size,args.input_size) / 0.18215
-                    example4 = reconstructed_img[1,-1,:].view(1,args.in_channels,args.input_size,args.input_size) / 0.18215
-                    samples = vae.decode(torch.cat([example,example2,example3,example4],0)).sample
-                    save_image(samples, "sample.png", nrow=2, normalize=True, value_range=(-1, 1))
+                    reconstructed_img = (z_indices)
+                    reconstructed_img = torch.flip(reconstructed_img,[1])
+                    example = reconstructed_img[0,:,:].view(args.discrete_number,args.in_channels,args.input_size,args.input_size) / 0.18215
+                    example = torch.stack([example[0],example[12],example[22],example[31]],0)
+                    save_image(vae.decode(example.float()).sample, f"real_{train_steps}.png", nrow=5, normalize=True, value_range=(-1, 1))
                     logger.info(f"visualization....")
+                    
+                    
                 dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
@@ -344,15 +377,16 @@ if __name__ == "__main__":
     parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path for resume training")
     parser.add_argument("--gpt-finetune", type=str, default=None, help="used for our method's fast evaluation")
     parser.add_argument("--gpt-type", type=str, choices=['c2i', 't2i'], default="c2i", help="class-conditional or text-conditional")
-    parser.add_argument("--ema", action='store_true', help="whether using ema training")
+    parser.add_argument("--ema", action='store_true', default=True, help="whether using ema training")
     parser.add_argument("--input-size", type=int, default=32, help="the size of latent code")
-    parser.add_argument("--patch-size", type=int, default=8, help="the size of patches")   
+    parser.add_argument("--patch-size", type=int, default=2, help="the size of patches")   
     parser.add_argument("--in-channels", type=int, default=4, help="the channel of latent code")
     parser.add_argument("--discrete-number", type=int, default=32, help="the number of tokens")
-    parser.add_argument("--schedule-type", type=str, default="ddpm", help="the type of noise schedule")
+    parser.add_argument("--schedule-type", type=str, default="rectified_flow", help="the type of noise schedule")
     parser.add_argument("--cls-token-num", type=int, default=1, help="max token number of condition input")
     parser.add_argument("--dropout-p", type=float, default=0.1, help="dropout_p of resid_dropout_p and ffn_dropout_p")
     parser.add_argument("--token-dropout-p", type=float, default=0.1, help="dropout_p of token_dropout_p")
+    parser.add_argument("--accumulate-number", type=float, default=4, help="accumulate-step")
     parser.add_argument("--drop-path-rate", type=float, default=0.0, help="using stochastic depth decay")
     parser.add_argument("--no-compile", type=bool, default=False)
     parser.add_argument("--results-dir", type=str, default="results")
@@ -366,9 +400,9 @@ if __name__ == "__main__":
     parser.add_argument("--beta1", type=float, default=0.9, help="beta1 parameter for the Adam optimizer")
     parser.add_argument("--beta2", type=float, default=0.95, help="beta2 parameter for the Adam optimizer")
     parser.add_argument("--max-grad-norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--global-batch-size", type=int, default=8)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--num-workers", type=int, default=24)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)

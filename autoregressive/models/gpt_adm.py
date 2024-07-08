@@ -45,7 +45,6 @@ class ModelArgs:
     model_type: str = 'c2i'
 
     cls_token_num: int = 1
-    block_size: int = 256
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
@@ -76,7 +75,7 @@ class FinalLayer(nn.Module):
         if c is not None:
             shift, scale = self.adaLN_modulation(c).chunk(2, dim=2)
         else:
-            shift, scale = 0, 1
+            shift, scale = 0, 0
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
@@ -304,7 +303,6 @@ class Attention(nn.Module):
             keys, values = xk, xv
         keys = keys.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
         values = values.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
-
         output = F.scaled_dot_product_attention(
             xq, keys, values, 
             attn_mask=mask, 
@@ -335,7 +333,7 @@ class TransformerBlock(nn.Module):
         if cond_embeddings is not None:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(cond_embeddings).chunk(6, dim=2)
         else:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = 0, 1, 1, 0, 1, 1
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = 0, 0, 1, 0, 0, 1
         h = x + gate_msa * self.drop_path(self.attention(modulate(self.attention_norm(x),shift_msa, scale_msa), freqs_cis, start_pos, mask))
         out = h + gate_mlp * self.drop_path(self.feed_forward(modulate(self.ffn_norm(h),shift_mlp, scale_mlp)))
         return out
@@ -346,7 +344,6 @@ class Transformer(nn.Module):
         super().__init__()
         self.config = config
         self.n_layer = config.n_layer
-        self.block_size = config.block_size
         self.num_classes = config.num_classes
         self.model_type = config.model_type
         self.cls_token_num = config.cls_token_num
@@ -412,14 +409,15 @@ class Transformer(nn.Module):
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
-        for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_head, head_dim, dtype)
+        # for b in self.layers:
+        #     b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_head, head_dim, dtype)
 
-        causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))        
-        for i in range(0, token_embeddings.shape[1], self.num_patches):
-            casual_mask[i:i+self.num_patches,i:i+self.num_patches] = 1
+        causal_mask = torch.full((self.max_seq_length, self.max_seq_length), float("-inf"))
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        for i in range(0, self.max_seq_length, self.num_patches):
+            causal_mask[i:i+self.num_patches,i:i+self.num_patches] = 0 
         self.causal_mask = causal_mask.unsqueeze(0).repeat(self.max_batch_size, 1, 1)
-        self.freqs_cis = precompute_freqs_cis_2d(config.discrete_number, self.num_patches, self.config.dim // self.config.n_head, self.config.rope_base)
+        self.freqs_cis = precompute_freqs_cis_2d(self.config.discrete_number, self.num_patches, self.config.dim // self.config.n_head, self.config.rope_base)
 
     def forward(
         self, 
@@ -459,7 +457,7 @@ class Transformer(nn.Module):
             
             h = self.tok_dropout(token_embeddings)
             self.freqs_cis = self.freqs_cis
-        
+
         if self.training:
             freqs_cis = self.freqs_cis[:token_embeddings.shape[1]]
             mask = torch.full((token_embeddings.shape[1], token_embeddings.shape[1]), float("-inf"), device=token_embeddings.device)
@@ -468,20 +466,19 @@ class Transformer(nn.Module):
                 mask[i:i+self.num_patches,i:i+self.num_patches] = 0
         else:
             freqs_cis = self.freqs_cis[input_pos]
-        
+            mask = self.causal_mask[0, input_pos, input_pos]
         # transformer blocks
         for i, layer in enumerate(self.layers):
             h = layer(h, freqs_cis, input_pos, cond_embeddings, mask)
         
         # output layers
-        reconstructed_img = self.output(h, cond_embeddings).float()
-        reconstructed_img = self.unpatchify(reconstructed_img) # [bs, t, cxhxw]
+        output = self.output(h, cond_embeddings).float()
+        output = self.unpatchify(output) # [bs, t, cxhxw]
         # if we are given some desired targets also calculate the loss
         loss = None
         if targets is not None:
-            loss = self.mean_flat((reconstructed_img - targets) ** 2).mean()
-
-        return reconstructed_img, loss
+            loss = self.mean_flat((output.permute(1,0,2) - targets.permute(1,0,2)) ** 2)
+        return output, loss
 
 
     def mean_flat(self,tensor):
@@ -494,7 +491,10 @@ class Transformer(nn.Module):
         c = self.in_channels #  [bs, token (txp), patch_size**2 * C)] 
         p = self.patch_size
         h = w = int(self.num_patches ** 0.5)
-        t = self.discrete_number
+        if self.training:
+            t = self.discrete_number
+        else:
+            t = int(x.shape[1] // (h * w))
         x = x.reshape(shape=(x.shape[0], t, h, w, p, p, c))
         imgs = einops.rearrange(x, 'b t h w p q c -> b t (c h p w q)')
         return imgs
