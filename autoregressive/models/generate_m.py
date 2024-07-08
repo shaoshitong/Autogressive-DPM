@@ -174,6 +174,6 @@ def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_int
                 next_token = (input_token - pred_noise * betas[alphas.shape[0] - i - 1]) # / alphas[alphas.shape[0] - i - 1]
             else:
                 next_token = (input_token - pred_noise * betas[alphas.shape[0] - i - 1]) # / alphas[alphas.shape[0] - i - 1]
+            print(next_token[:, 0, :].mean(),next_token[:, 0, :].std())
             seq.append(next_token[:, 0, :])
-            # next_token = torch.clamp(next_token,-1,1)
-    return torch.cat([seq[1],seq[5],seq[10],seq[15]],0)
+    return torch.cat([seq[1],seq[21],seq[25],seq[31]],0)

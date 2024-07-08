@@ -128,7 +128,7 @@ def main(args):
         print(f"no need to compile model in demo") 
 
     # Labels to condition the model with (feel free to change):
-    class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
+    class_labels = [207] #360, 387, 974, 88, 979, 417, 279]
     c_indices = torch.tensor(class_labels, device=device)
     latent_size = args.input_size // args.patch_size
     t1 = time.time()
@@ -162,7 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--gpt-type", type=str, choices=['c2i', 't2i'], default="c2i", help="class-conditional or text-conditional")
     parser.add_argument("--from-fsdp", action='store_true')
     parser.add_argument("--input-size", type=int, default=32, help="the size of latent code")
-    parser.add_argument("--patch-size", type=int, default=8, help="the size of patches")   
+    parser.add_argument("--patch-size", type=int, default=2, help="the size of patches")   
     parser.add_argument("--in-channels", type=int, default=4, help="the channel of latent code")
     parser.add_argument("--discrete-number", type=int, default=32, help="the number of tokens")
     parser.add_argument("--schedule-type", type=str, default="ddpm", help="the type of noise schedule")  
